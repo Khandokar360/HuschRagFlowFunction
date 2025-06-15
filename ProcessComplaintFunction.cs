@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using SmartComponents.LocalEmbeddings;
 using HuschRagFlowEngineFunctionApp.Service;
-using Microsoft.Extensions.AI;
+using Azure.Storage.Blobs.Models;
 
 namespace HuschRagFlowEngineFunctionApp
 {
@@ -19,201 +19,240 @@ namespace HuschRagFlowEngineFunctionApp
         private readonly IConfiguration _configuration;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly IMemoryCache _cache;
-    //    private readonly PDFViewerModel _pdfViewerModel;
+        private readonly LocalEmbedder _embedder;
+        private readonly AzureAIService _azureAIService;
 
         private readonly string _connectionStringBlobStorage;
-        private string _blobContainerName;
         private readonly string _chatCompletionEndpoint;
         private readonly string _azureOpenAIApiKey;
 
-     public ProcessComplaintFunction(
-    ILogger<ProcessComplaintFunction> logger,
-    IConfiguration configuration,
-    IHttpClientFactory httpClientFactory,
-    IMemoryCache memoryCache)
+        // Define matter type mappings as static readonly
+        private static readonly Dictionary<string, string> MatterTypeContainerMappings = new()
         {
-            _logger = logger;
-            _configuration = configuration;
-            _httpClientFactory = httpClientFactory;
-            _cache = memoryCache;
+            { "Glyphosate Matter", "glyphosate-complaintfile" },
+            { "Asbestos NonMidwest Matter", "asbestos-nmidwest-complaintfile" },
+            { "Paraquat Matter", "paraquat-complaintfile" },
+            { "Talc Matter", "talc-complaintfile" }
+        };
 
-            // Load configuration values.       
-            _chatCompletionEndpoint = _configuration["AzureOpenAI.ChatCompletion.Endpoint"];
-            _azureOpenAIApiKey = _configuration["AzureOpenAI.ApiKey"];         
-            _connectionStringBlobStorage = _configuration["Azure.BlobStorage.ConnectionString"];
-            _blobContainerName = "";
+        public ProcessComplaintFunction(
+            ILogger<ProcessComplaintFunction> logger,
+            IConfiguration configuration,
+            IHttpClientFactory httpClientFactory,
+            IMemoryCache memoryCache,
+            LocalEmbedder embedder,
+            AzureAIService azureAIService)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+            _cache = memoryCache ?? throw new ArgumentNullException(nameof(memoryCache));
+            _embedder = embedder ?? throw new ArgumentNullException(nameof(embedder));
+            _azureAIService = azureAIService ?? throw new ArgumentNullException(nameof(azureAIService));
+
+            // Load configuration values with validation
+            _chatCompletionEndpoint = _configuration["AzureOpenAI.ChatCompletion.Endpoint"]
+                ?? throw new InvalidOperationException("AzureOpenAI.ChatCompletion.Endpoint is required");
+            _azureOpenAIApiKey = _configuration["AzureOpenAI.ApiKey"]
+                ?? throw new InvalidOperationException("AzureOpenAI.ApiKey is required");
+            _connectionStringBlobStorage = _configuration["Azure.BlobStorage.ConnectionString"]
+                ?? throw new InvalidOperationException("Azure.BlobStorage.ConnectionString is required");
         }
-
-
-
-
 
         [Function("ProcessComplaint")]
         public async Task<IActionResult> Run([HttpTrigger(AuthorizationLevel.Function, "get", "post")] HttpRequest req)
         {
-            _logger.LogInformation("C# HTTP trigger function processed a request.");
+            _logger.LogInformation("ProcessComplaint function triggered");
 
             try
             {
                 // Validate the request is multipart/form-data
                 if (!req.HasFormContentType)
                 {
+                    _logger.LogWarning("Invalid content type. Expected multipart/form-data");
                     return new BadRequestObjectResult("Request must be 'multipart/form-data' with a PDF file and JSON question(s).");
                 }
 
-
-
-                // Get the uploaded PDF
+                // Get the uploaded PDF and validate
                 var formData = await req.ReadFormAsync();
                 var pdfFile = formData.Files.GetFile("file");
+
                 if (pdfFile == null || pdfFile.Length == 0)
                 {
+                    _logger.LogWarning("No file uploaded or file is empty");
                     return new BadRequestObjectResult("Please upload a PDF file using 'file' as the form field name.");
                 }
 
-
-                // Validate file
-                if (formData.Files["file"] is not IFormFile file)
+                // Validate file type
+                if (!pdfFile.ContentType.Equals("application/pdf", StringComparison.OrdinalIgnoreCase))
                 {
+                    _logger.LogWarning($"Invalid file type: {pdfFile.ContentType}. Expected PDF");
                     return new BadRequestObjectResult("Please upload a PDF file.");
                 }
 
-
                 // Get the question data
-                if (!formData.TryGetValue("data", out var questionValues) || string.IsNullOrEmpty(questionValues.FirstOrDefault()))
+                if (!formData.TryGetValue("data", out var questionValues) || string.IsNullOrWhiteSpace(questionValues.FirstOrDefault()))
                 {
+                    _logger.LogWarning("No question data provided");
                     return new BadRequestObjectResult("Please provide 'data' in the form data.");
                 }
 
-                string questionPayload = questionValues.FirstOrDefault();
-                if (questionPayload.Contains("Glyphosate Matter"))
-                {
-                    _blobContainerName = "glyphosate-complaintfile";
-                }
-                else if (questionPayload.Contains("Asbestos NonMidwest Matter"))
-                {
-                    _blobContainerName = "asbestos-nmidwest-complaintfile";
-                }
-                else if (questionPayload.Contains("Paraquat Matter"))
-                {
-                    _blobContainerName = "paraquat-complaintfile";
-                }
-                else if (questionPayload.Contains("Talc Matter"))
-                {
-                    _blobContainerName = "talc-complaintfile";
-                }
+                string questionPayload = questionValues.FirstOrDefault()!;
 
-                else
+                // Determine container name based on matter type
+                string? blobContainerName = DetermineBlobContainerName(questionPayload);
+                if (string.IsNullOrEmpty(blobContainerName))
                 {
+                    _logger.LogWarning($"Invalid matter type in payload: {questionPayload}");
                     return new BadRequestObjectResult("Invalid matter type in the question payload.");
                 }
-                //call UploadFileAsync
-                UploadFileAsync(file, file.FileName, _blobContainerName).Wait();
 
-                // Parse the incoming JSON payload more efficiently
+                // Upload file to blob storage
+                string blobUri = await UploadFileAsync(pdfFile, pdfFile.FileName, blobContainerName);
+                _logger.LogInformation($"File uploaded successfully: {blobUri}");
+
+                // Parse questions
                 List<QuestionConfig> questions = await ParseQuestionsAsync(questionPayload);
                 if (!questions.Any())
                 {
+                    _logger.LogWarning("No valid questions found in payload");
                     return new BadRequestObjectResult("No valid questions provided.");
                 }
-                // Call SummaryPDF method to generate a short document summary
-                var embedder = new LocalEmbedder();
-                var openAiConfig = new OpenAIConfiguration();
-                var pdfViewerModel = new PDFViewerModel(embedder, new AzureAIService(openAiConfig));
-                string summary = await SummaryPDF(file, pdfViewerModel);
-                _logger.LogInformation($"Summary: {summary}");
 
+                // Generate PDF summary
+                var pdfViewerModel = new PDFViewerModel(_embedder, _azureAIService);
+                string summary = await SummaryPDF(pdfFile, pdfViewerModel);
 
+                _logger.LogInformation("PDF summary generated successfully");
 
-
+                return new OkObjectResult(new
+                {
+                    Summary = summary,
+                    BlobUri = blobUri,
+                    QuestionsCount = questions.Count
+                });
             }
-            catch (Exception)
+            catch (ArgumentException ex)
             {
-
-                throw;
+                _logger.LogError(ex, "Invalid argument provided");
+                return new BadRequestObjectResult(ex.Message);
             }
+            catch (JsonException ex)
+            {
+                _logger.LogError(ex, "JSON parsing error");
+                return new BadRequestObjectResult("Invalid JSON format in question payload.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "An unexpected error occurred processing the complaint");
+                return new StatusCodeResult(500);
+            }
+        }
 
-
-            return new OkObjectResult("Welcome to Azure Functions!");
+        private string? DetermineBlobContainerName(string questionPayload)
+        {
+            return MatterTypeContainerMappings.FirstOrDefault(kvp =>
+                questionPayload.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase)).Value;
         }
 
         public async Task<string> UploadFileAsync(IFormFile file, string fileName, string containerName)
         {
             if (file == null || file.Length == 0)
-                throw new ArgumentException("File is empty or null.");
+                throw new ArgumentException("File is empty or null.", nameof(file));
 
-            var blobServiceClient = new BlobServiceClient(_connectionStringBlobStorage);
-            var containerClient = blobServiceClient.GetBlobContainerClient(containerName);
+            if (string.IsNullOrWhiteSpace(fileName))
+                throw new ArgumentException("File name cannot be empty.", nameof(fileName));
 
-            // Ensure the container exists
-            //  await containerClient.CreateIfNotExistsAsync();
+            if (string.IsNullOrWhiteSpace(containerName))
+                throw new ArgumentException("Container name cannot be empty.", nameof(containerName));
 
-            var blobClient = containerClient.GetBlobClient(fileName);
-
-            using (var stream = new MemoryStream())
+            try
             {
-                await file.CopyToAsync(stream);
-                stream.Position = 0;
-                await blobClient.UploadAsync(stream, overwrite: true);
-            }
+                var blobServiceClient = new BlobServiceClient(_connectionStringBlobStorage);
+                var containerClient = blobServiceClient.GetBlobContainerClient(containerName);
 
-            _logger.LogInformation($"File uploaded to Blob Storage with name: {fileName}");
-            return blobClient.Uri.ToString();
+                // Generate unique filename to avoid conflicts
+                string uniqueFileName = $"{Guid.NewGuid()}_{fileName}";
+                var blobClient = containerClient.GetBlobClient(uniqueFileName);
+
+                // Upload with proper content type
+                using var stream = file.OpenReadStream();
+                await blobClient.UploadAsync(stream, new BlobHttpHeaders { ContentType = file.ContentType });
+
+                _logger.LogInformation($"File uploaded to Blob Storage: {uniqueFileName}");
+                return blobClient.Uri.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to upload file to blob storage");
+                throw new InvalidOperationException("Failed to upload file to blob storage.", ex);
+            }
         }
 
         private async Task<List<QuestionConfig>> ParseQuestionsAsync(string questionPayload)
         {
-            List<QuestionConfig> questions = new List<QuestionConfig>();
+            var questions = new List<QuestionConfig>();
 
             try
             {
-                // Fast path for direct QuestionConfig array
-                if (questionPayload.TrimStart().StartsWith("[{"))
+                if (string.IsNullOrWhiteSpace(questionPayload))
                 {
-                    return JsonConvert.DeserializeObject<List<QuestionConfig>>(questionPayload);
+                    return questions;
+                }
+
+                var trimmedPayload = questionPayload.Trim();
+
+                // Fast path for direct QuestionConfig array
+                if (trimmedPayload.StartsWith("[{"))
+                {
+                    var parsedQuestions = JsonConvert.DeserializeObject<List<QuestionConfig>>(trimmedPayload);
+                    return parsedQuestions ?? new List<QuestionConfig>();
                 }
 
                 // Try to parse the nested MatterTypes structure
-                if (questionPayload.TrimStart().StartsWith("{"))
+                if (trimmedPayload.StartsWith("{"))
                 {
-                    var matterTypesRequest = JsonConvert.DeserializeObject<MatterTypesRequest>(questionPayload);
+                    var matterTypesRequest = JsonConvert.DeserializeObject<MatterTypesRequest>(trimmedPayload);
                     if (matterTypesRequest?.MatterTypes != null && matterTypesRequest.MatterTypes.Any())
                     {
-                        // Combine all questions from all matter types
                         questions = matterTypesRequest.MatterTypes
-                            .SelectMany(mt => mt.Value.Questions)
+                            .SelectMany(mt => mt.Value?.Questions ?? Enumerable.Empty<QuestionConfig>())
+                            .Where(q => q != null && !string.IsNullOrWhiteSpace(q.QuestionText))
                             .ToList();
                     }
                 }
 
                 // Fallback: if it's not JSON in that format, check if it is an array of simple strings
-                if (!questions.Any())
+                if (!questions.Any() && trimmedPayload.StartsWith("["))
                 {
-                    // If it starts with '[' we assume an array of strings
-                    if (questionPayload.TrimStart().StartsWith("["))
-                    {
-                        var simpleQuestions = JsonConvert.DeserializeObject<List<string>>(questionPayload);
-                        // Create default config objects from these simple strings
-                        questions = simpleQuestions.Select(q => new QuestionConfig { QuestionText = q }).ToList();
-                    }
-                    else
-                    {
-                        // Otherwise, treat it as a raw string
-                        questions.Add(new QuestionConfig { QuestionText = questionPayload });
-                    }
+                    var simpleQuestions = JsonConvert.DeserializeObject<List<string>>(trimmedPayload);
+                    questions = simpleQuestions?
+                        .Where(q => !string.IsNullOrWhiteSpace(q))
+                        .Select(q => new QuestionConfig { QuestionText = q })
+                        .ToList() ?? new List<QuestionConfig>();
+                }
+
+                // Final fallback: treat as raw string if no questions found yet
+                if (!questions.Any() && !string.IsNullOrWhiteSpace(trimmedPayload))
+                {
+                    questions.Add(new QuestionConfig { QuestionText = trimmedPayload });
                 }
             }
-            catch (System.Text.Json.JsonException)
+            catch (JsonException ex)
             {
-                _logger.LogInformation("Failed to parse the JSON question; treating the input as a raw string.");
-                questions.Add(new QuestionConfig { QuestionText = questionPayload });
+                _logger.LogWarning(ex, "Failed to parse JSON question payload, treating as raw string");
+                if (!string.IsNullOrWhiteSpace(questionPayload))
+                {
+                    questions.Add(new QuestionConfig { QuestionText = questionPayload });
+                }
             }
 
             return questions;
         }
+
         public static async Task<string> SummaryPDF(IFormFile pdfFile, PDFViewerModel pdfViewerModel)
         {
-            string systemPrompt = "You are a helpful assistant. Your task is to analyze the provided text and generate short summary.";
+            const string systemPrompt = "You are a helpful assistant. Your task is to analyze the provided text and generate a concise summary.";
 
             try
             {
@@ -221,20 +260,13 @@ namespace HuschRagFlowEngineFunctionApp
                 await pdfViewerModel.LoadDocument(stream, "application/pdf");
 
                 var result = await pdfViewerModel.FetchResponseFromAIService(systemPrompt);
-                var suggestions = await pdfViewerModel.GetSuggestions();
 
-                if (string.IsNullOrEmpty(result))
-                {
-                    return "No summary generated.";
-                }
-
-                return result;
+                return string.IsNullOrWhiteSpace(result) ? "No summary generated." : result;
             }
             catch (Exception ex)
             {
-                return $"Error: {ex.Message}";
+                return $"Error generating summary: {ex.Message}";
             }
         }
     }
-
 }
