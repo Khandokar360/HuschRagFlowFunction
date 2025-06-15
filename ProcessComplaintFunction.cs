@@ -7,6 +7,9 @@ using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using SmartComponents.LocalEmbeddings;
+using HuschRagFlowEngineFunctionApp.Service;
+using Microsoft.Extensions.AI;
 
 namespace HuschRagFlowEngineFunctionApp
 {
@@ -113,9 +116,12 @@ namespace HuschRagFlowEngineFunctionApp
                 {
                     return new BadRequestObjectResult("No valid questions provided.");
                 }
-                //call SummaryPDF method
-
-              //  string summary = await SummaryPDF(file, _pdfViewerModel);
+                // Call SummaryPDF method to generate a short document summary
+                var embedder = new LocalEmbedder();
+                var openAiConfig = new OpenAIConfiguration();
+                var pdfViewerModel = new PDFViewerModel(embedder, new AzureAIService(openAiConfig));
+                string summary = await SummaryPDF(file, pdfViewerModel);
+                _logger.LogInformation($"Summary: {summary}");
 
 
 
